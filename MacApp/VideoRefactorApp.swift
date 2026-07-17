@@ -43,6 +43,43 @@ struct EnhancementPreset: Identifiable, Hashable {
             defaultCRF: 17
         ),
         EnhancementPreset(
+            id: "ultra",
+            title: "Ultra",
+            detail: "Максимальное качество",
+            filters: [
+                "nlmeans=s=3.0:p=7:r=15",
+                "deband=1thr=0.018:2thr=0.018:3thr=0.018:range=16:blur=true",
+                "eq=contrast=1.04:saturation=1.05",
+                "unsharp=5:5:0.35:3:3:0.15",
+            ],
+            defaultCRF: 16
+        ),
+        EnhancementPreset(
+            id: "oldfilm",
+            title: "Old",
+            detail: "Старые и дрожащие видео",
+            filters: [
+                "deflicker",
+                "deshake=rx=12:ry=12:edge=mirror",
+                "nlmeans=s=2.6:p=7:r=15",
+                "eq=contrast=1.07:saturation=1.04:gamma=1.02",
+                "unsharp=5:5:0.40:3:3:0.18",
+            ],
+            defaultCRF: 17
+        ),
+        EnhancementPreset(
+            id: "compressed",
+            title: "Compressed",
+            detail: "Видео из мессенджеров",
+            filters: [
+                "hqdn3d=2.2:2.2:7:7",
+                "deband=1thr=0.024:2thr=0.024:3thr=0.024:range=18:blur=true",
+                "eq=contrast=1.05:saturation=1.07",
+                "unsharp=5:5:0.30:3:3:0.12",
+            ],
+            defaultCRF: 18
+        ),
+        EnhancementPreset(
             id: "upscale",
             title: "Upscale",
             detail: "Увеличение 2x",
@@ -69,6 +106,15 @@ struct EncodeJob {
     let width: String
     let height: String
     let fps: String
+    let denoise: String
+    let sharpen: String
+    let deband: Bool
+    let deshake: Bool
+    let highQualityDenoise: Bool
+    let aiEnhance: Bool
+    let aiExecutable: String
+    let aiModel: String
+    let aiScale: String
     let crf: String
     let codec: String
     let encoderPreset: String
@@ -198,20 +244,19 @@ final class EncoderRunner: ObservableObject {
             throw AppError("ffmpeg не найден. Установите его через Homebrew: brew install ffmpeg")
         }
 
-        var filters = job.preset.filters
-        if !job.width.isEmpty || !job.height.isEmpty {
-            let width = try positiveNumber(job.width, fallback: "-2", name: "Ширина")
-            let height = try positiveNumber(job.height, fallback: "-2", name: "Высота")
-            filters.removeAll { $0.hasPrefix("scale=") }
-            filters.append("scale=\(width):\(height):flags=lanczos")
+        if job.aiEnhance {
+            return try makeAICommand(job: job, inputURL: inputURL, outputURL: outputURL, forceOverwrite: forceOverwrite)
         }
+
+        var filters = try buildFilters(job: job)
         if !job.fps.isEmpty {
             filters.append("fps=\(try positiveNumber(job.fps, fallback: "", name: "FPS"))")
         }
-
+        _ = ffmpeg
+        let ffmpegPath = ffmpeg
         let encoding = encodingSettings(job: job, forceCPU: forceCPU)
         var command = [
-            ffmpeg,
+            ffmpegPath,
             "-hide_banner",
             job.overwrite || forceOverwrite ? "-y" : "-n",
             "-i",
@@ -243,6 +288,113 @@ final class EncoderRunner: ObservableObject {
         command += ["-movflags", "+faststart", outputURL.path]
         return command
     }
+
+    private func makeAICommand(job: EncodeJob, inputURL: URL, outputURL: URL, forceOverwrite: Bool) throws -> [String] {
+        guard let python = findExecutable("python3") else {
+            throw AppError("python3 не найден.")
+        }
+        guard let helper = Bundle.main.path(forResource: "video_enhancer", ofType: "py") ?? fallbackHelperPath() else {
+            throw AppError("AI helper video_enhancer.py не найден в приложении.")
+        }
+
+        var command = [
+            python,
+            helper,
+            inputURL.path,
+            outputURL.path,
+            "--preset",
+            job.preset.id,
+            "--speed",
+            job.speedMode,
+            "--bitrate",
+            try bitrateValue(job.bitrate),
+            "--ai-enhance",
+            "--ai-executable",
+            job.aiExecutable.isEmpty ? "realesrgan-ncnn-vulkan" : job.aiExecutable,
+            "--ai-model",
+            job.aiModel.isEmpty ? "realesrgan-x4plus" : job.aiModel,
+            "--ai-scale",
+            try aiScaleValue(job.aiScale),
+        ]
+
+        if !job.width.isEmpty {
+            command += ["--width", try positiveNumber(job.width, fallback: "", name: "Ширина")]
+        }
+        if !job.height.isEmpty {
+            command += ["--height", try positiveNumber(job.height, fallback: "", name: "Высота")]
+        }
+        if !job.fps.isEmpty {
+            command += ["--fps", try positiveNumber(job.fps, fallback: "", name: "FPS")]
+        }
+        if !job.denoise.isEmpty {
+            command += ["--denoise", try strengthValue(job.denoise, name: "Шумодав")]
+        }
+        if !job.sharpen.isEmpty {
+            command += ["--sharpen", try strengthValue(job.sharpen, name: "Резкость")]
+        }
+        if job.deband {
+            command.append("--deband")
+        }
+        if job.deshake {
+            command.append("--deshake")
+        }
+        if job.highQualityDenoise {
+            command.append("--high-quality-denoise")
+        }
+        if !job.crf.isEmpty {
+            command += ["--crf", try crfValue(job.crf)]
+        }
+        if job.codec != "auto" {
+            command += ["--codec", job.codec]
+        }
+        if job.encoderPreset != "auto" {
+            command += ["--encoder-preset", job.encoderPreset]
+        }
+        if job.removeAudio {
+            command.append("--no-audio")
+        } else if !job.copyAudio {
+            command.append("--no-copy-audio")
+        }
+        if job.overwrite || forceOverwrite {
+            command.append("--overwrite")
+        }
+
+        return command
+    }
+
+    private func buildFilters(job: EncodeJob) throws -> [String] {
+        var filters = job.preset.filters
+
+        if !job.denoise.isEmpty {
+            filters.removeAll { $0.hasPrefix("hqdn3d=") || $0.hasPrefix("nlmeans=") }
+            if let denoise = denoiseFilter(try strengthDouble(job.denoise, name: "Шумодав"), highQuality: job.highQualityDenoise) {
+                filters.insert(denoise, at: 0)
+            }
+        }
+
+        if !job.sharpen.isEmpty {
+            filters.removeAll { $0.hasPrefix("unsharp=") }
+            if let sharpen = sharpenFilter(try strengthDouble(job.sharpen, name: "Резкость")) {
+                filters.append(sharpen)
+            }
+        }
+
+        if job.deband && !filters.contains(where: { $0.hasPrefix("deband=") }) {
+            filters.append("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16:blur=true")
+        }
+
+        if job.deshake && !filters.contains(where: { $0.hasPrefix("deshake=") }) {
+            filters.insert("deshake=rx=12:ry=12:edge=mirror", at: 0)
+        }
+
+        if !job.width.isEmpty || !job.height.isEmpty {
+            let width = try positiveNumber(job.width, fallback: "-2", name: "Ширина")
+            let height = try positiveNumber(job.height, fallback: "-2", name: "Высота")
+            filters.removeAll { $0.hasPrefix("scale=") }
+            filters.append("scale=\(width):\(height):flags=lanczos")
+        }
+        return filters
+    }
 }
 
 struct ContentView: View {
@@ -254,6 +406,15 @@ struct ContentView: View {
     @State private var width = ""
     @State private var height = ""
     @State private var fps = ""
+    @State private var denoise = ""
+    @State private var sharpen = ""
+    @State private var deband = false
+    @State private var deshake = false
+    @State private var highQualityDenoise = false
+    @State private var aiEnhance = false
+    @State private var aiExecutable = "realesrgan-ncnn-vulkan"
+    @State private var aiModel = "realesrgan-x4plus"
+    @State private var aiScale = "2"
     @State private var crf = ""
     @State private var codec = "auto"
     @State private var encoderPreset = "auto"
@@ -332,6 +493,33 @@ struct ContentView: View {
                     Toggle("Удалить аудио", isOn: $removeAudio)
                     Toggle("Перезаписывать файл", isOn: $overwrite)
                 }
+
+                Section {
+                    HStack {
+                        labeledTextField("Шумодав", text: $denoise, placeholder: "preset")
+                        labeledTextField("Резкость", text: $sharpen, placeholder: "preset")
+                    }
+                    Toggle("Качественный шумодав nlmeans", isOn: $highQualityDenoise)
+                    Toggle("Убрать цветовые полосы", isOn: $deband)
+                    Toggle("Стабилизация", isOn: $deshake)
+                }
+
+                Section {
+                    Toggle("AI Enhance", isOn: $aiEnhance)
+                    HStack {
+                        labeledTextField("AI scale", text: $aiScale, placeholder: "2")
+                        labeledTextField("AI model", text: $aiModel, placeholder: "realesrgan-x4plus")
+                    }
+                    HStack {
+                        Text("AI binary")
+                            .frame(width: 110, alignment: .leading)
+                        TextField("realesrgan-ncnn-vulkan", text: $aiExecutable)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    Text("AI режим использует внешний Real-ESRGAN-совместимый бинарник.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -341,7 +529,7 @@ struct ContentView: View {
             Divider()
             footer
         }
-        .frame(minWidth: 760, minHeight: 680)
+        .frame(minWidth: 820, minHeight: 780)
     }
 
     private var speedModeDetail: String {
@@ -486,6 +674,15 @@ struct ContentView: View {
             width: width.trimmingCharacters(in: .whitespacesAndNewlines),
             height: height.trimmingCharacters(in: .whitespacesAndNewlines),
             fps: fps.trimmingCharacters(in: .whitespacesAndNewlines),
+            denoise: denoise.trimmingCharacters(in: .whitespacesAndNewlines),
+            sharpen: sharpen.trimmingCharacters(in: .whitespacesAndNewlines),
+            deband: deband,
+            deshake: deshake,
+            highQualityDenoise: highQualityDenoise,
+            aiEnhance: aiEnhance,
+            aiExecutable: aiExecutable.trimmingCharacters(in: .whitespacesAndNewlines),
+            aiModel: aiModel.trimmingCharacters(in: .whitespacesAndNewlines),
+            aiScale: aiScale.trimmingCharacters(in: .whitespacesAndNewlines),
             crf: crf.trimmingCharacters(in: .whitespacesAndNewlines),
             codec: codec,
             encoderPreset: encoderPreset,
@@ -542,6 +739,46 @@ func positiveNumber(_ text: String, fallback: String, name: String) throws -> St
     return "\(value)"
 }
 
+func strengthDouble(_ text: String, name: String) throws -> Double {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let value = Double(trimmed) else {
+        throw AppError("\(name): введите число от 0 до 10.")
+    }
+    guard (0...10).contains(value) else {
+        throw AppError("\(name): используйте значение от 0 до 10.")
+    }
+    return value
+}
+
+func strengthValue(_ text: String, name: String) throws -> String {
+    "\(try strengthDouble(text, name: name))"
+}
+
+func denoiseFilter(_ strength: Double, highQuality: Bool) -> String? {
+    if strength <= 0 {
+        return nil
+    }
+
+    if highQuality {
+        let nlmeansStrength = 1.0 + strength * 1.8
+        return String(format: "nlmeans=s=%.2f:p=7:r=15", nlmeansStrength)
+    }
+
+    let spatial = 0.8 + strength * 0.35
+    let temporal = 3.0 + strength * 0.9
+    return String(format: "hqdn3d=%.2f:%.2f:%.2f:%.2f", spatial, spatial, temporal, temporal)
+}
+
+func sharpenFilter(_ strength: Double) -> String? {
+    if strength <= 0 {
+        return nil
+    }
+
+    let luma = min(1.2, strength * 0.12)
+    let chroma = min(0.45, strength * 0.04)
+    return String(format: "unsharp=5:5:%.2f:3:3:%.2f", luma, chroma)
+}
+
 func crfValue(_ text: String) throws -> String {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let value = Int(trimmed) else {
@@ -549,6 +786,15 @@ func crfValue(_ text: String) throws -> String {
     }
     guard (0...51).contains(value) else {
         throw AppError("CRF: используйте значение от 0 до 51.")
+    }
+    return "\(value)"
+}
+
+func aiScaleValue(_ text: String) throws -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let valueText = trimmed.isEmpty ? "2" : trimmed
+    guard let value = Int(valueText), [2, 3, 4].contains(value) else {
+        throw AppError("AI scale: используйте 2, 3 или 4.")
     }
     return "\(value)"
 }
@@ -561,6 +807,12 @@ func bitrateValue(_ text: String) throws -> String {
         throw AppError("Битрейт: используйте формат вроде 8000k или 12M.")
     }
     return value
+}
+
+func fallbackHelperPath() -> String? {
+    let currentDirectory = FileManager.default.currentDirectoryPath
+    let candidate = URL(fileURLWithPath: currentDirectory).appendingPathComponent("video_enhancer.py").path
+    return FileManager.default.fileExists(atPath: candidate) ? candidate : nil
 }
 
 func isVideoToolbox(_ codec: String) -> Bool {

@@ -23,5 +23,6 @@ swiftc \
   -o "$MACOS_DIR/VideoRefactor"
 
 cp "$ROOT_DIR/MacApp/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$ROOT_DIR/video_enhancer.py" "$RESOURCES_DIR/video_enhancer.py"
 
 echo "Built: $APP_DIR"
