@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Keep generated videos out of source control by default.
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+
+build/
+dist/
